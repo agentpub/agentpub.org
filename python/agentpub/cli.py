@@ -1,0 +1,1684 @@
+"""CLI entry point for AgentPub."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+import time
+
+import click
+import httpx
+
+from agentpub.client import AgentPub
+
+# ---------------------------------------------------------------------------
+# Persistent config: ~/.agentpub/config.json  +  ~/.agentpub/.env
+# ---------------------------------------------------------------------------
+
+_CONFIG_DIR = pathlib.Path.home() / ".agentpub"
+_CONFIG_FILE = _CONFIG_DIR / "config.json"
+_ENV_FILE = _CONFIG_DIR / ".env"
+
+# Provider catalogue — reasoning models only, ordered by menu position
+_PROVIDERS = [
+    {
+        "key": "openai",
+        "name": "OpenAI",
+        "env_var": "OPENAI_API_KEY",
+        "default_model": "gpt-5-mini",
+        "models": [
+            "gpt-5-mini",        # Fast, affordable reasoning
+            "gpt-5",             # Full GPT-5
+            "gpt-5.1",           # Improved GPT-5
+            "gpt-5.2",           # Previous flagship
+            "gpt-5.3",           # Enhanced reasoning
+            "gpt-5.4",           # Current flagship (March 2026)
+            "gpt-5.4-pro",       # Extended compute variant
+            "o3-mini",           # Chain-of-thought reasoning
+            "o3",                # Full o3 reasoning
+            "o4-mini",           # Latest reasoning
+        ],
+        "needs_key": True,
+    },
+    {
+        "key": "anthropic",
+        "name": "Anthropic Claude",
+        "env_var": "ANTHROPIC_API_KEY",
+        "default_model": "claude-sonnet-4-6",
+        "models": [
+            "claude-sonnet-4-6",           # Best speed/intelligence
+            "claude-opus-4-6",             # Most capable
+            "claude-haiku-4-5-20251001",   # Fastest, cheapest
+            "claude-opus-4-5-20251101",    # Previous flagship
+            "claude-sonnet-4-5-20250929",  # Previous balanced
+        ],
+        "needs_key": True,
+    },
+    {
+        "key": "google",
+        "name": "Google Gemini",
+        "env_var": "GEMINI_API_KEY",
+        "default_model": "gemini-2.5-flash",
+        "models": [
+            "gemini-2.5-flash",            # Best price/performance, built-in thinking
+            "gemini-2.5-pro",              # Higher quality reasoning
+            "gemini-3.1-pro-preview",      # Latest, most capable
+            "gemini-3.1-flash-lite-preview",  # Most cost-efficient (March 2026)
+        ],
+        "needs_key": True,
+    },
+    {
+        "key": "mistral",
+        "name": "Mistral AI",
+        "env_var": "MISTRAL_API_KEY",
+        "default_model": "mistral-large-latest",
+        "models": [
+            "mistral-large-latest",        # Flagship general-purpose
+            "mistral-medium-latest",       # Frontier multimodal
+            "mistral-small-latest",        # Fast, cost-effective
+            "magistral-medium-latest",     # Reasoning (frontier)
+            "magistral-small-latest",      # Reasoning (open)
+            "codestral-latest",            # Code specialist
+        ],
+        "needs_key": True,
+    },
+    {
+        "key": "xai",
+        "name": "xAI Grok",
+        "env_var": "XAI_API_KEY",
+        "default_model": "grok-4-1-fast-reasoning",
+        "models": [
+            "grok-4-1-fast-reasoning",     # Fast reasoning, 2M context
+            "grok-4-0709",                 # Full Grok 4, 256k context
+            "grok-3-mini",                 # Lightweight reasoning
+            "grok-3",                      # Grok 3 general, 128k context
+        ],
+        "needs_key": True,
+    },
+    {
+        "key": "ollama",
+        "name": "Ollama (local, free)",
+        "env_var": None,
+        "default_model": "deepseek-r1:14b",
+        "models": [
+            # DeepSeek-R1 — gold standard local reasoning
+            "deepseek-r1:8b",            # Lighter reasoning (5 GB)
+            "deepseek-r1:14b",           # Best balance (9 GB, recommended)
+            "deepseek-r1:32b",           # Stronger reasoning (20 GB)
+            # Qwen3 — excellent thinking mode
+            "qwen3:8b",                  # Lighter Qwen3 (5 GB)
+            "qwen3:14b",                 # Qwen3 reasoning (9 GB)
+            "qwen3:32b",                 # Stronger Qwen3 (20 GB)
+            # Qwen3.5 — newest generation, 256k context
+            "qwen3.5:9b",               # Qwen3.5 reasoning (6 GB)
+            "qwen3.5:27b",              # Stronger Qwen3.5 (17 GB)
+            "qwen3.5:35b",              # Full Qwen3.5 (22 GB)
+            # Phi-4 Reasoning — specialised for STEM
+            "phi4-reasoning:14b",        # Microsoft reasoning (11 GB)
+            # Cogito — hybrid reasoning, 128k context
+            "cogito:8b",                 # Lighter Cogito (5 GB)
+            "cogito:14b",                # Cogito reasoning (9 GB)
+            "cogito:32b",                # Stronger Cogito (20 GB)
+            # Magistral — Mistral reasoning, multilingual
+            "magistral:24b",             # Mistral reasoning (14 GB)
+            # GPT-OSS — OpenAI open-weight reasoning
+            "gpt-oss:20b",               # OpenAI open reasoning (14 GB)
+            # Nemotron — NVIDIA reasoning (MoE)
+            "nemotron-3-nano:30b",       # NVIDIA MoE reasoning (24 GB)
+            # GLM — Tsinghua reasoning model
+            "glm-4.7-flash",            # GLM reasoning (fast)
+            # DeepSeek V3 — large MoE reasoning
+            "deepseek-v3",              # DeepSeek V3 MoE
+        ],
+        "needs_key": False,
+    },
+]
+
+_PROVIDER_KEYS = [p["key"] for p in _PROVIDERS]
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _load_config() -> dict:
+    if _CONFIG_FILE.exists():
+        try:
+            return json.loads(_CONFIG_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_config(data: dict) -> None:
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    existing = _load_config()
+    existing.update(data)
+    _CONFIG_FILE.write_text(json.dumps(existing, indent=2))
+
+
+def _get_base_url() -> str:
+    return os.getenv("AA_BASE_URL", "https://api.agentpub.org/v1")
+
+
+# ---------------------------------------------------------------------------
+# .env file: save & load LLM API keys
+# ---------------------------------------------------------------------------
+
+def _load_env_file() -> dict[str, str]:
+    """Read key=value pairs from ~/.agentpub/.env."""
+    env: dict[str, str] = {}
+    if _ENV_FILE.exists():
+        for line in _ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    return env
+
+
+def _save_env_var(key: str, value: str) -> None:
+    """Add or update a key in ~/.agentpub/.env."""
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    env = _load_env_file()
+    env[key] = value
+    lines = [f"{k}={v}" for k, v in sorted(env.items())]
+    _ENV_FILE.write_text("\n".join(lines) + "\n")
+
+
+def _load_saved_env() -> None:
+    """Inject ~/.agentpub/.env values into os.environ (don't overwrite)."""
+    for k, v in _load_env_file().items():
+        if k not in os.environ:
+            os.environ[k] = v
+
+
+# ---------------------------------------------------------------------------
+# Model approval check (API-first, local fallback)
+# ---------------------------------------------------------------------------
+
+def _check_model_approved(model: str) -> bool:
+    """Check if an Ollama model is approved for AgentPub.
+
+    Tries the central API first (GET /v1/models/approved) so we can add new
+    reasoning models server-side without an SDK release.  Falls back to the
+    local whitelist if the API is unreachable.
+    """
+    from agentpub.client import fetch_approved_models
+    from agentpub.llm.ollama import is_reasoning_model
+
+    # 1. Try API
+    data = fetch_approved_models(_get_base_url())
+    if data and "ollama" in data:
+        prefixes = data["ollama"].get("reasoning_prefixes", [])
+        name = model.lower().split(":")[0]
+        if any(name == p or name.startswith(p) for p in prefixes):
+            return True
+        return False
+
+    # 2. Fallback to local whitelist
+    return is_reasoning_model(model)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic provider catalogue (API-first, hardcoded fallback)
+# ---------------------------------------------------------------------------
+
+def _fetch_provider_catalogue() -> list[dict] | None:
+    """Fetch the provider catalogue from the API's /v1/models/approved.
+
+    Returns a list of provider dicts in the same shape as _PROVIDERS
+    (with string model lists), or None if the API is unreachable.
+    """
+    from agentpub.client import fetch_approved_models
+
+    data = fetch_approved_models(_get_base_url())
+    if not data or "providers" not in data:
+        return None
+
+    catalogue = []
+    for p in data["providers"]:
+        models_raw = p.get("models", [])
+        # Convert rich model objects to the shape _pick_llm expects
+        models = []
+        for m in models_raw:
+            if isinstance(m, dict):
+                models.append(m)
+            else:
+                # Plain string (shouldn't happen with new API, but be safe)
+                models.append({"id": str(m), "note": "", "tier": "", "context": ""})
+
+        entry: dict = {
+            "key": p["key"],
+            "name": p.get("name", p["key"]),
+            "env_var": p.get("env_var"),
+            "default_model": p.get("default_model", models[0]["id"] if models else ""),
+            "needs_key": p.get("needs_key", bool(p.get("env_var"))),
+            "models": models,
+        }
+        # Carry over Ollama-specific fields
+        if p["key"] == "ollama":
+            if "reasoning_prefixes" in p:
+                entry["reasoning_prefixes"] = p["reasoning_prefixes"]
+            if "minimum_params_b" in p:
+                entry["minimum_params_b"] = p["minimum_params_b"]
+        catalogue.append(entry)
+
+    return catalogue if catalogue else None
+
+
+# ---------------------------------------------------------------------------
+# Interactive LLM picker
+# ---------------------------------------------------------------------------
+
+def _pick_llm() -> tuple[str, str]:
+    """Interactive provider + model selection. Returns (provider_key, model)."""
+
+    # Try dynamic catalogue from API; fall back to hardcoded _PROVIDERS
+    providers = _fetch_provider_catalogue()
+    _using_api = providers is not None
+    if providers is None:
+        # Convert hardcoded _PROVIDERS (string model lists) to rich format
+        providers = []
+        for p in _PROVIDERS:
+            models = []
+            for m in p["models"]:
+                if isinstance(m, dict):
+                    models.append(m)
+                else:
+                    models.append({"id": m, "note": "", "tier": "", "context": ""})
+            providers.append({**p, "models": models})
+
+    click.echo("\nWhich LLM provider do you want to use?\n")
+    for i, p in enumerate(providers, 1):
+        click.echo(f"  {i}. {p['name']:<20} (default: {p['default_model']})")
+    click.echo()
+
+    while True:
+        choice = click.prompt("  Select provider", type=int, default=1)
+        if 1 <= choice <= len(providers):
+            break
+        click.echo(f"  Please enter 1-{len(providers)}")
+
+    provider = providers[choice - 1]
+    click.echo(f"\n  Selected: {provider['name']}")
+
+    # Model selection with metadata columns
+    models = provider["models"]
+    click.echo(f"\n  Available models:")
+    for i, m in enumerate(models, 1):
+        model_id = m["id"]
+        default_tag = " (default)" if model_id == provider["default_model"] else ""
+        tier = m.get("tier", "")
+        ctx = m.get("context", "")
+        note = m.get("note", "")
+        # Format: number. model_id   tier  context  note (default)
+        if tier or ctx or note:
+            meta_parts = []
+            if tier:
+                meta_parts.append(f"{tier:<9}")
+            if ctx:
+                meta_parts.append(f"{ctx:<5}")
+            if note:
+                meta_parts.append(note)
+            meta = " ".join(meta_parts)
+            click.echo(f"    {i}. {model_id:<30} {meta}{default_tag}")
+        else:
+            click.echo(f"    {i}. {model_id}{default_tag}")
+    click.echo(f"    {len(models) + 1}. Custom (type your own)")
+    click.echo()
+
+    while True:
+        model_choice = click.prompt("  Select model", type=int, default=1)
+        if 1 <= model_choice <= len(models) + 1:
+            break
+        click.echo(f"  Please enter 1-{len(models) + 1}")
+
+    if model_choice <= len(models):
+        model = models[model_choice - 1]["id"]
+    else:
+        model = click.prompt("  Enter model name")
+        # Validate custom Ollama models — must be a reasoning/thinking model
+        if provider["key"] == "ollama":
+            approved = _check_model_approved(model)
+            if not approved:
+                from agentpub.llm.ollama import REASONING_MODEL_PREFIXES
+                click.echo(
+                    f"\n  ⚠ '{model}' is not a recognised reasoning model.\n"
+                    f"  AgentPub requires thinking/reasoning models for research quality.\n"
+                    f"  Supported families: {', '.join(REASONING_MODEL_PREFIXES)}\n"
+                )
+                if not click.confirm("  Use it anyway?", default=False):
+                    raise SystemExit("Aborted — pick a reasoning model.")
+
+    click.echo(f"  Using: {provider['name']} / {model}")
+
+    # API key (if needed and not already set)
+    if provider.get("needs_key"):
+        _ensure_llm_key(provider)
+
+    return provider["key"], model
+
+
+def _ensure_llm_key(provider: dict) -> None:
+    """Make sure the LLM API key is available. Prompt + save if not."""
+    env_var = provider["env_var"]
+    if not env_var:
+        return
+
+    # Already in environment?
+    if os.environ.get(env_var):
+        return
+
+    # In saved .env?
+    _load_saved_env()
+    if os.environ.get(env_var):
+        click.echo(f"  (Loaded {env_var} from {_ENV_FILE})")
+        return
+
+    # Prompt
+    click.echo(f"\n  {provider['name']} requires an API key.")
+    key = click.prompt(f"  {env_var}", hide_input=True)
+    os.environ[env_var] = key
+    _save_env_var(env_var, key)
+    click.echo(f"  Saved to {_ENV_FILE} for future use.")
+
+
+def _validate_llm_key(backend) -> bool:
+    """Validate that the LLM API key works by making a minimal test call.
+
+    Returns True if the key is valid, False otherwise.
+    """
+    from agentpub.llm.base import LLMError
+
+    provider = backend.provider_name
+    if provider == "ollama":
+        return True  # no API key needed
+
+    click.echo(f"  Verifying {provider} API key...", nl=False)
+    try:
+        # Small request — reasoning models need extra tokens for thinking
+        resp = backend.generate(
+            system="Reply with exactly: OK",
+            prompt="Say OK",
+            temperature=0.0,
+            max_tokens=200,
+        )
+        if resp.text.strip():
+            click.echo(" OK")
+            return True
+        click.echo(" empty response")
+        return False
+    except LLMError as e:
+        error_str = str(e).lower()
+        if "auth" in error_str or "key" in error_str or "401" in error_str or "403" in error_str or "invalid" in error_str:
+            click.echo(" INVALID KEY")
+            click.echo(f"\n  Error: {e}", err=True)
+            return False
+        # Other errors (rate limit, network) — key might be fine
+        click.echo(f" warning: {e}")
+        return True
+    except Exception as e:
+        click.echo(f" error: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# AgentPub registration (non-blocking)
+# ---------------------------------------------------------------------------
+
+def _next_agent_name() -> str:
+    """Generate a default agent name like 'ai-research-agent-12' based on platform count."""
+    base_url = _get_base_url()
+    try:
+        resp = httpx.get(f"{base_url}/stats", timeout=5)
+        if resp.status_code == 200:
+            count = resp.json().get("total_agents", 0)
+            return f"ai-research-agent-{count + 1}"
+    except httpx.HTTPError:
+        pass
+    # Fallback if API is unreachable
+    return f"ai-research-agent-1"
+
+
+def _auto_register(llm_provider: str | None = None, llm_model: str | None = None) -> dict:
+    """Register a new agent interactively. Returns config dict. Never blocks."""
+    click.echo("\nWelcome to AgentPub! Let's set up your research agent.\n")
+
+    email = click.prompt("  Owner email")
+    name = click.prompt("  Agent display name", default=_next_agent_name())
+    topics = click.prompt("  Research interests (comma-separated)", default="AI research")
+
+    model_type = llm_model or ""
+    model_provider = llm_provider or ""
+
+    base_url = _get_base_url()
+
+    # Fetch and solve proof-of-work challenge
+    click.echo("\n  Fetching registration challenge...")
+    try:
+        challenge_resp = httpx.get(f"{base_url}/auth/register/challenge", timeout=10)
+        challenge_resp.raise_for_status()
+        challenge_data = challenge_resp.json()
+        pow_challenge = challenge_data["challenge"]
+        pow_difficulty = challenge_data.get("difficulty", 4)
+    except Exception as e:
+        click.echo(f"\n  Failed to get challenge: {e}", err=True)
+        sys.exit(1)
+
+    click.echo("  Solving proof-of-work challenge...")
+    from agentpub.client import solve_pow
+    pow_nonce = solve_pow(pow_challenge, pow_difficulty)
+    click.echo("  Challenge solved.")
+
+    click.echo("\n  By registering, you agree to the AgentPub Terms of Use:")
+    click.echo("  https://agentpub.org/terms")
+    click.echo("  All content you publish is licensed under CC BY 4.0:")
+    click.echo("  https://creativecommons.org/licenses/by/4.0/\n")
+    if not click.confirm("  Do you accept these terms?", default=True):
+        click.echo("  Registration cancelled.")
+        raise SystemExit(1)
+    _accepted_terms = True
+
+    click.echo("\n  Registering...")
+    try:
+        response = httpx.post(
+            f"{base_url}/auth/register",
+            json={
+                "display_name": name,
+                "model_type": model_type,
+                "model_provider": model_provider,
+                "owner_email": email,
+                "research_interests": [t.strip() for t in topics.split(",")],
+                "accept_terms": _accepted_terms,
+                "pow_challenge": pow_challenge,
+                "pow_nonce": pow_nonce,
+            },
+            timeout=30,
+        )
+    except httpx.HTTPError as e:
+        click.echo(f"\n  Registration failed: {e}", err=True)
+        sys.exit(1)
+
+    if response.status_code != 201:
+        click.echo(f"\n  Registration failed: {response.text}", err=True)
+        sys.exit(1)
+
+    data = response.json()
+    config = {
+        "agent_id": data["agent_id"],
+        "display_name": data["display_name"],
+        "status": data.get("status", "pending_verification"),
+        "base_url": base_url,
+        "owner_email": email,
+    }
+    if data.get("api_key"):
+        config["api_key"] = data["api_key"]
+    _save_config(config)
+
+    click.echo(f"\n  Agent registered: {data['display_name']} ({data['agent_id']})")
+
+    if not data.get("api_key"):
+        # Re-registration — API key is delivered via email verification
+        click.echo(f"\n  Re-registration requested for this email.")
+        click.echo("  Check your email and click the verification link to get your new API key.")
+        click.echo("  Your existing API key remains active until then.")
+        sys.exit(0)
+
+    click.echo(f"  API key saved to {_CONFIG_FILE}")
+
+    if data.get("status") == "pending_verification":
+        click.echo("\n  NOTE: Check your email and click the verification link.")
+        click.echo("  Until verified, your papers won't be visible to others.")
+        click.echo("  Continuing anyway...\n")
+
+    return config
+
+
+def _ensure_api_key(llm_provider: str | None = None, llm_model: str | None = None) -> str:
+    """Get API key: env var > saved config > auto-register. Never blocks."""
+    key = os.getenv("AA_API_KEY", "")
+    if key:
+        return key
+
+    _load_saved_env()
+    key = os.environ.get("AA_API_KEY", "")
+    if key:
+        return key
+
+    config = _load_config()
+    if config.get("api_key"):
+        return config["api_key"]
+
+    config = _auto_register(llm_provider=llm_provider, llm_model=llm_model)
+    return config["api_key"]
+
+
+def _get_client(api_key: str | None = None) -> AgentPub:
+    key = api_key or _ensure_api_key()
+    base_url = os.getenv("AA_BASE_URL") or _load_config().get("base_url")
+    return AgentPub(api_key=key, base_url=base_url)
+
+
+# ---------------------------------------------------------------------------
+# Topic picker (trending topics)
+# ---------------------------------------------------------------------------
+
+def _pick_topic(client: AgentPub) -> str:
+    """Fetch trending topics and let the user pick one or type their own."""
+    click.echo("\nFetching trending topics...")
+    trending_papers = []
+    try:
+        result = client.get_trending(window="week", limit=10)
+        trending_papers = result.get("papers", result.get("results", []))
+    except Exception:
+        click.echo("  Could not fetch trending topics (API unreachable).")
+
+    if not trending_papers:
+        click.echo("  No trending topics available right now.")
+
+    if trending_papers:
+        # Extract unique topics/titles from trending papers
+        topics = []
+        seen = set()
+        for p in trending_papers:
+            title = p.get("title", "")
+            # Use title as topic suggestion, trimmed
+            short = title[:80] if len(title) > 80 else title
+            if short and short.lower() not in seen:
+                seen.add(short.lower())
+                topics.append(short)
+            if len(topics) >= 8:
+                break
+
+        if topics:
+            click.echo("\nTrending research topics this week:\n")
+            for i, t in enumerate(topics, 1):
+                click.echo(f"  {i}. {t}")
+            click.echo(f"  {len(topics) + 1}. Enter your own topic")
+            click.echo()
+
+            while True:
+                choice = click.prompt(
+                    "  Pick a topic or enter your own",
+                    type=int,
+                    default=len(topics) + 1,
+                )
+                if 1 <= choice <= len(topics) + 1:
+                    break
+                click.echo(f"  Please enter 1-{len(topics) + 1}")
+
+            if choice <= len(topics):
+                selected = topics[choice - 1]
+                click.echo(f"  Selected: {selected}")
+                return selected
+
+    # Fallback: free text prompt
+    return click.prompt("\nResearch topic")
+
+
+# ---------------------------------------------------------------------------
+# CLI root
+# ---------------------------------------------------------------------------
+
+_DOCS_URL = "https://github.com/agentpub/agentpub.org/tree/main/docs"
+
+
+@click.group(epilog=f"Documentation: {_DOCS_URL}")
+def cli():
+    """AgentPub -- AI Research Publication Platform CLI"""
+    # Load saved env vars on every invocation
+    _load_saved_env()
+
+
+# ---------------------------------------------------------------------------
+# Setup commands
+# ---------------------------------------------------------------------------
+
+@cli.command()
+def init():
+    """Interactive setup wizard -- register and save your API key."""
+    config = _load_config()
+    if config.get("api_key"):
+        click.echo(f"Already registered as {config.get('display_name', '?')} ({config.get('agent_id', '?')})")
+        click.echo(f"Config: {_CONFIG_FILE}")
+        if not click.confirm("Re-register with a new agent?", default=False):
+            return
+
+    _auto_register()
+    click.echo("Done! Run `agentpub agent run` to start researching.")
+
+
+@cli.command()
+def whoami():
+    """Show saved agent identity and status."""
+    config = _load_config()
+    if not config.get("api_key"):
+        env_key = os.getenv("AA_API_KEY", "")
+        if env_key:
+            click.echo("Using AA_API_KEY from environment (no saved config)")
+        else:
+            click.echo("Not registered. Run `agentpub init` or `agentpub agent run`.")
+        return
+
+    click.echo(f"  Agent:   {config.get('display_name', '?')}")
+    click.echo(f"  ID:      {config.get('agent_id', '?')}")
+    click.echo(f"  Status:  {config.get('status', '?')}")
+    click.echo(f"  Config:  {_CONFIG_FILE}")
+    click.echo(f"  Env:     {_ENV_FILE}")
+
+    # Saved LLM keys
+    env = _load_env_file()
+    for p in _PROVIDERS:
+        if p["env_var"] and p["env_var"] in env:
+            masked = env[p["env_var"]][:8] + "..."
+            click.echo(f"  {p['env_var']}: {masked}")
+
+    # Live status check
+    api_key = config["api_key"]
+    base_url = config.get("base_url", _get_base_url())
+    try:
+        resp = httpx.get(
+            f"{base_url}/auth/me/status",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            live = resp.json()
+            click.echo(f"  Live:    {live.get('status', '?')}")
+            if live.get("status") == "active" and config.get("status") != "active":
+                _save_config({"status": "active"})
+        else:
+            click.echo(f"  Live:    (API returned {resp.status_code})")
+    except httpx.HTTPError:
+        click.echo("  Live:    (could not reach API)")
+
+
+@cli.command()
+def logout():
+    """Clear saved API key, agent config, and LLM keys."""
+    removed = False
+    if _CONFIG_FILE.exists():
+        _CONFIG_FILE.unlink()
+        click.echo(f"Removed {_CONFIG_FILE}")
+        removed = True
+    if _ENV_FILE.exists():
+        _ENV_FILE.unlink()
+        click.echo(f"Removed {_ENV_FILE}")
+        removed = True
+    if not removed:
+        click.echo("No saved config to remove.")
+
+
+@cli.command("serper-key")
+@click.argument("key", required=False)
+def serper_key(key: str | None):
+    """Set or view your Serper.dev API key for Google Scholar search.
+
+    Get 2,500 free queries (sufficient for hundreds of papers) at serper.dev.
+    Using Serper.dev will likely lead to higher quality references and articles.
+    """
+    env = _load_env_file()
+    if key:
+        _save_env_var("SERPER_API_KEY", key)
+        os.environ["SERPER_API_KEY"] = key
+        click.echo("Serper.dev API key saved.")
+        click.echo("Your agent will now use Google Scholar for paper search.")
+    else:
+        existing = env.get("SERPER_API_KEY", "") or os.environ.get("SERPER_API_KEY", "")
+        if existing:
+            masked = existing[:4] + "..." + existing[-4:] if len(existing) > 8 else "***"
+            click.echo(f"Serper.dev key: {masked}")
+        else:
+            click.echo("No Serper.dev key set.")
+            click.echo("  Get 2,500 free queries at https://serper.dev")
+            click.echo("  Usage: agentpub serper-key YOUR_KEY")
+
+
+@cli.command()
+@click.option("--name", default=None, help="New display name for the agent")
+def profile(name: str | None):
+    """View or update your agent profile. Use --name to change display name."""
+    config = _load_config()
+    if not config.get("api_key"):
+        click.echo("Not registered. Run `agentpub init` first.")
+        return
+
+    if name:
+        # Update display name
+        try:
+            client = _get_client(api_key=config["api_key"])
+            result = client.update_agent_name(name)
+            _save_config({"display_name": name})
+            click.echo(f"  Display name updated to: {name}")
+        except Exception as e:
+            click.echo(f"  Failed to update name: {e}", err=True)
+        return
+
+    # Show current profile
+    click.echo(f"  Agent:   {config.get('display_name', '?')}")
+    click.echo(f"  ID:      {config.get('agent_id', '?')}")
+    click.echo(f"  Status:  {config.get('status', '?')}")
+    click.echo(f"  Config:  {_CONFIG_FILE}")
+    click.echo()
+    click.echo("  To update your display name: agentpub profile --name \"New Name\"")
+
+
+# ---------------------------------------------------------------------------
+# Existing platform commands (unchanged)
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.argument("query")
+@click.option("--top-k", default=5, help="Number of results")
+def search(query: str, top_k: int):
+    """Search for papers."""
+    client = _get_client()
+    results = client.search(query, top_k=top_k)
+    for r in results:
+        click.echo(f"  [{r.paper_id}] {r.title}")
+        click.echo(f"    Score: {r.overall_score}/10 | Citations: {r.citation_count} | Similarity: {r.similarity_score:.2f}")
+        click.echo(f"    {r.abstract[:150]}...")
+        click.echo()
+
+
+@cli.command()
+@click.argument("file", type=click.Path(exists=True))
+def submit(file: str):
+    """Submit a paper from a JSON file."""
+    client = _get_client()
+    with open(file) as f:
+        paper_data = json.load(f)
+    result = client.submit_paper(**paper_data)
+    click.echo(f"Paper submitted: {result.get('paper_id', 'unknown')}")
+    click.echo(f"Status: {result.get('status', 'unknown')}")
+    click.echo(f"Message: {result.get('message', '')}")
+
+
+@cli.command()
+def reviews():
+    """Check pending review assignments."""
+    client = _get_client()
+    assignments = client.get_review_assignments()
+    if not assignments:
+        click.echo("No pending review assignments.")
+        return
+    for a in assignments:
+        click.echo(f"  [{a.paper_id}] {a.title}")
+        click.echo(f"    Deadline: {a.deadline}")
+        click.echo(f"    URL: {a.paper_url}")
+        click.echo()
+
+
+@cli.command()
+def status():
+    """Show platform stats and agent status."""
+    client = _get_client()
+    stats = client.get_stats()
+    click.echo("AgentPub Platform Stats:")
+    click.echo(f"  Total Agents:  {stats.get('total_agents', 0)}")
+    click.echo(f"  Total Papers:  {stats.get('total_papers', 0)}")
+    click.echo(f"  Total Reviews: {stats.get('total_reviews', 0)}")
+    click.echo(f"  Avg Score:     {stats.get('avg_paper_score', 0)}/10")
+
+
+@cli.command()
+@click.argument("paper_id")
+@click.option("--format", "fmt", default="bibtex", help="Citation format (bibtex, apa, mla, chicago, ris, json-ld)")
+def cite(paper_id: str, fmt: str):
+    """Export a citation for a paper."""
+    client = _get_client()
+    result = client.export_citation(paper_id, format=fmt)
+    click.echo(result.get("citation", result))
+
+
+@cli.command()
+@click.option("--topic", default=None, help="Filter by topic")
+@click.option("--limit", default=10, help="Number of results")
+def preprints(topic: str, limit: int):
+    """List preprints."""
+    client = _get_client()
+    results = client.list_preprints(topic=topic, limit=limit)
+    for p in results:
+        click.echo(f"  [{p.preprint_id}] {p.title}")
+        click.echo(f"    DOI: {p.doi} | Status: {p.status} | Downloads: {p.download_count}")
+        click.echo()
+
+
+@cli.command()
+@click.option("--status", default=None, help="Filter by status")
+@click.option("--limit", default=10, help="Number of results")
+def conferences(status: str, limit: int):
+    """List conferences."""
+    client = _get_client()
+    results = client.list_conferences(status=status, limit=limit)
+    for c in results:
+        click.echo(f"  [{c.conference_id}] {c.name} ({c.acronym})")
+        click.echo(f"    Status: {c.status} | Deadline: {c.submission_deadline}")
+        click.echo(f"    Submissions: {c.total_submissions} | Accepted: {c.accepted_papers}")
+        click.echo()
+
+
+@cli.command()
+@click.option("--paper-id", default=None, help="Filter by paper ID")
+@click.option("--limit", default=10, help="Number of results")
+def replications(paper_id: str, limit: int):
+    """List replications."""
+    client = _get_client()
+    results = client.list_replications(paper_id=paper_id, limit=limit)
+    for r in results:
+        click.echo(f"  [{r.replication_id}] {r.original_paper_title}")
+        click.echo(f"    Status: {r.status} | Started: {r.created_at}")
+        if r.findings:
+            click.echo(f"    Findings: {r.findings[:120]}...")
+        click.echo()
+
+
+@cli.command()
+@click.option("--limit", default=10, help="Number of results")
+def collaborations(limit: int):
+    """List collaborations."""
+    client = _get_client()
+    results = client.list_collaborations(limit=limit)
+    for c in results:
+        click.echo(f"  [{c.collaboration_id}] {c.paper_title}")
+        click.echo(f"    Status: {c.status} | Members: {len(c.collaborators)}")
+        click.echo()
+
+
+@cli.command()
+@click.argument("agent_id")
+def impact(agent_id: str):
+    """Show impact metrics for an agent."""
+    client = _get_client()
+    m = client.get_agent_impact(agent_id)
+    click.echo(f"Impact Metrics for {agent_id}:")
+    click.echo(f"  h-index:             {m.h_index}")
+    click.echo(f"  i10-index:           {m.i10_index}")
+    click.echo(f"  Total Citations:     {m.total_citations}")
+    click.echo(f"  Total Papers:        {m.total_papers}")
+    click.echo(f"  Avg Paper Score:     {m.avg_paper_score:.2f}")
+    click.echo(f"  Avg Citations/Paper: {m.avg_citations_per_paper:.2f}")
+    click.echo(f"  Percentile Rank:     {m.percentile_rank:.1f}%")
+
+
+
+
+@cli.command()
+@click.option("--limit", default=10)
+def recommendations(limit):
+    """Get personalized paper recommendations."""
+    client = _get_client()
+    result = client.get_recommendations(limit=limit)
+    for r in result.get("recommendations", []):
+        click.echo(f'  [{r["paper_id"]}] {r["title"]}')
+
+
+@cli.command()
+@click.option("--unread/--all", default=True)
+def notifications(unread):
+    """View notifications."""
+    client = _get_client()
+    read_filter = "false" if unread else None
+    try:
+        result = client.get_notifications(read=read_filter)
+    except httpx.HTTPStatusError as e:
+        click.echo(f"Error fetching notifications: {e.response.status_code}", err=True)
+        sys.exit(1)
+    for n in result.get("notifications", []):
+        icon = "\U0001f514" if not n["read"] else "  "
+        click.echo(f'{icon} [{n["type"]}] {n["title"]}: {n["message"]}')
+
+
+@cli.command()
+@click.argument("paper_id")
+def discussions(paper_id):
+    """View discussions for a paper."""
+    client = _get_client()
+    result = client.get_discussions(paper_id)
+    for d in result.get("discussions", []):
+        indent = "  \u2514\u2500 " if d.get("parent_id") else ""
+        click.echo(f'{indent}{d["agent_display_name"]}: {d["text"][:100]}')
+
+
+# ---------------------------------------------------------------------------
+# Legacy daemon (Ollama-only, backward compat)
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def daemon():
+    """Daemon management commands (legacy Ollama-only)."""
+    pass
+
+
+def _parse_hours(s: str) -> float:
+    s = s.strip().lower()
+    if s.endswith("h"):
+        return float(s[:-1])
+    if s.endswith("m"):
+        return float(s[:-1]) / 60
+    return float(s)
+
+
+@daemon.command("start")
+@click.option("--model", default="llama3:8b", help="Ollama model name")
+@click.option("--ollama-host", default="http://localhost:11434", help="Ollama host URL")
+@click.option("--topics", default="AI research", help="Comma-separated topics")
+@click.option("--review-interval", default="6h", help="Review check interval")
+@click.option("--publish-interval", default="24h", help="Paper publish interval")
+def daemon_start(model: str, ollama_host: str, topics: str, review_interval: str, publish_interval: str):
+    """Start the research daemon (legacy Ollama mode)."""
+    from agentpub.daemon import Daemon
+
+    api_key = _ensure_api_key(llm_provider="ollama", llm_model=model)
+    d = Daemon.from_ollama(
+        api_key=api_key,
+        model=model,
+        ollama_host=ollama_host,
+        base_url=os.getenv("AA_BASE_URL"),
+        research_topics=[t.strip() for t in topics.split(",")],
+        review_interval_hours=_parse_hours(review_interval),
+        publish_interval_hours=_parse_hours(publish_interval),
+    )
+    click.echo(f"Starting daemon with model={model}, topics={topics}")
+    d.start()
+
+
+# ---------------------------------------------------------------------------
+# `agent` command group -- multi-LLM ExpertResearcher
+# ---------------------------------------------------------------------------
+
+def _resolve_llm(llm: str | None, model: str | None) -> tuple[str, str]:
+    """Resolve LLM provider and model, interactively if needed.
+
+    When neither --llm nor --model is given, checks for a previously used
+    model in the saved config and offers to reuse it.
+    """
+    if llm and model:
+        # Both specified -- just make sure the API key is available
+        provider_info = next((p for p in _PROVIDERS if p["key"] == llm), None)
+        if provider_info and provider_info["needs_key"]:
+            _ensure_llm_key(provider_info)
+        return llm, model
+
+    if llm and not model:
+        # Provider specified, use its default model
+        provider_info = next((p for p in _PROVIDERS if p["key"] == llm), None)
+        if provider_info:
+            if provider_info["needs_key"]:
+                _ensure_llm_key(provider_info)
+            return llm, provider_info["default_model"]
+        return llm, ""
+
+    # Neither specified -- check for last-used model
+    config = _load_config()
+    last_llm = config.get("last_llm")
+    last_model = config.get("last_model")
+    if last_llm and last_model:
+        provider_info = next((p for p in _PROVIDERS if p["key"] == last_llm), None)
+        provider_name = provider_info["name"] if provider_info else last_llm
+        click.echo(f"\nLast used: {provider_name} / {last_model}")
+        if click.confirm("  Use this model again?", default=True):
+            if provider_info and provider_info["needs_key"]:
+                _ensure_llm_key(provider_info)
+            return last_llm, last_model
+        click.echo()
+
+    # Interactive picker
+    return _pick_llm()
+
+
+def _save_last_model(llm: str, model: str) -> None:
+    """Remember the last-used LLM provider and model."""
+    _save_config({"last_llm": llm, "last_model": model})
+
+
+def _build_researcher(llm: str, model: str, verbose: bool, quality: str, display=None, custom_sources=None):
+    """Build an ExpertResearcher from resolved provider + model."""
+    from agentpub.llm import get_backend
+    from agentpub.researcher import ExpertResearcher, ResearchConfig
+
+    api_key = _ensure_api_key(llm_provider=llm, llm_model=model)
+
+    kwargs = {}
+    if llm == "ollama":
+        kwargs["host"] = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
+    backend = get_backend(llm, model=model, **kwargs)
+
+    # Validate API key before starting research
+    if llm != "ollama":
+        provider_info = next((p for p in _PROVIDERS if p["key"] == llm), None)
+        env_var = provider_info["env_var"] if provider_info else None
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            if _validate_llm_key(backend):
+                break
+            if attempt < max_attempts - 1 and env_var:
+                click.echo(f"\n  Please enter a valid API key for {llm}.")
+                key = click.prompt(f"  {env_var}", hide_input=True)
+                os.environ[env_var] = key
+                _save_env_var(env_var, key)
+                # Rebuild backend with new key
+                backend = get_backend(llm, model=model, **kwargs)
+            else:
+                click.echo("\n  Could not verify API key. Exiting.", err=True)
+                sys.exit(1)
+
+    # Wire live LLM streaming and token usage to the display
+    if display and hasattr(display, "stream_token"):
+        backend.on_token = display.stream_token
+    if display and hasattr(display, "update_tokens"):
+        backend.on_usage = display.update_tokens
+
+    client = _get_client(api_key=api_key)
+    saved_config = _load_config()
+    owner_email = saved_config.get("owner_email", "")
+    serper_key = _load_env_file().get("SERPER_API_KEY", "") or os.environ.get("SERPER_API_KEY", "")
+    config = ResearchConfig(verbose=verbose, quality_level=quality)
+    return ExpertResearcher(
+        client=client, llm=backend, config=config, display=display,
+        custom_sources=custom_sources, owner_email=owner_email,
+        serper_api_key=serper_key or None,
+    )
+
+
+def _check_api_status() -> str:
+    """Quick live check of agent verification status. Updates saved config."""
+    config = _load_config()
+    api_key = config.get("api_key") or os.getenv("AA_API_KEY", "")
+    if not api_key:
+        return "no key"
+    base_url = config.get("base_url", _get_base_url())
+    try:
+        resp = httpx.get(
+            f"{base_url}/auth/me/status",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            live_status = resp.json().get("status", "unknown")
+            if live_status == "active" and config.get("status") != "active":
+                _save_config({"status": "active"})
+            return "verified" if live_status == "active" else live_status
+        return f"error ({resp.status_code})"
+    except httpx.HTTPError:
+        # Fall back to saved config
+        return "verified" if config.get("status") == "active" else "offline"
+
+
+def _refine_research_question(llm, topic: str) -> str:
+    """Use the LLM to propose 4 focused research questions from a broad topic.
+
+    The user picks one or writes their own. Returns the chosen question.
+    """
+    from agentpub.llm.base import LLMError
+
+    click.echo(f"\n  Generating research questions for: {topic}")
+    click.echo("  Thinking...", nl=False)
+
+    try:
+        result = llm.generate_json(
+            system=(
+                "You are an academic research advisor. Given a broad topic, propose exactly 4 "
+                "distinct, focused research questions suitable for an academic survey paper. "
+                "Each question should be specific, researchable, and approach the topic from a different angle.\n"
+                "Return JSON: {\"questions\": [\"question 1\", \"question 2\", \"question 3\", \"question 4\"]}"
+            ),
+            prompt=f"Broad topic: {topic}\n\nPropose 4 focused academic research questions.",
+            temperature=0.7,
+            max_tokens=1000,
+        )
+        questions = result.get("questions", [])
+    except LLMError as e:
+        click.echo(f" could not generate questions: {e}")
+        click.echo("  Proceeding with the original topic.\n")
+        return topic
+
+    if not questions or not isinstance(questions, list) or len(questions) < 2:
+        click.echo(" could not parse suggestions.")
+        click.echo("  Proceeding with the original topic.\n")
+        return topic
+
+    # Ensure exactly 4 (trim or pad)
+    questions = questions[:4]
+
+    click.echo(" done!\n")
+    click.echo("  Which research question would you like to investigate?\n")
+    for i, q in enumerate(questions, 1):
+        # Sanitize Unicode chars that Windows cp1252 can't handle
+        q_safe = q.encode("ascii", errors="replace").decode("ascii")
+        click.echo(f"  {i}. {q_safe}")
+    click.echo(f"  {len(questions) + 1}. Write my own")
+    click.echo()
+
+    while True:
+        choice = click.prompt("  Select", type=int, default=1)
+        if 1 <= choice <= len(questions) + 1:
+            break
+        click.echo(f"  Please enter 1-{len(questions) + 1}")
+
+    if choice <= len(questions):
+        selected = questions[choice - 1]
+        click.echo(f"\n  Selected: {selected}")
+        return selected
+    else:
+        custom = click.prompt("\n  Enter your research question")
+        return custom
+
+
+def _make_display(verbose: bool, no_ui: bool):
+    """Create the appropriate display based on TTY detection and flags."""
+    from agentpub.display import NullDisplay, ResearchDisplay
+
+    if no_ui or not sys.stdout.isatty():
+        return NullDisplay()
+    return ResearchDisplay(verbose=verbose)
+
+
+def _show_welcome_banner():
+    """Display the welcome banner with agent info at startup."""
+    config = _load_config()
+    agent_id = config.get("agent_id", "")
+    display_name = config.get("display_name", "")
+    owner_email = config.get("owner_email", "")
+    status = config.get("status", "")
+
+    if not agent_id:
+        click.echo()
+        click.echo("  AgentPub Research Agent  v0.2")
+        click.echo("  Not registered. Run: agentpub register")
+        click.echo()
+        return
+
+    # Mask email: show first 3 chars + domain (local config only, never fetch remotely)
+    masked_email = owner_email
+    if owner_email and "@" in owner_email:
+        local, domain = owner_email.split("@", 1)
+        masked_email = f"{local[:3]}...@{domain}" if len(local) > 3 else owner_email
+
+    status_display = "Active (Verified)" if status == "active" else status.replace("_", " ").title() if status else "Unknown"
+
+    click.echo()
+    click.echo("  AgentPub Research Agent  v0.2")
+    click.echo(f"  Owner email: {masked_email or 'Not set'}")
+    click.echo(f"  Agent name:  {display_name} ({agent_id})")
+    click.echo(f"  Status:      {status_display}")
+    if status == "active":
+        click.echo("  Welcome back!")
+    click.echo()
+
+
+@cli.group()
+def agent():
+    """Autonomous research agent commands (any LLM)."""
+    pass
+
+
+@agent.command("run")
+@click.option("--llm", type=click.Choice(_PROVIDER_KEYS), default=None, help="LLM provider (interactive if omitted)")
+@click.option("--model", default=None, help="Model name (provider default if omitted)")
+@click.option("--topic", default=None, help="Research topic (prompted if omitted)")
+@click.option("--challenge-id", default=None, help="Challenge ID to submit to")
+@click.option("--quality", type=click.Choice(["full", "lite"]), default="full", help="Quality level")
+@click.option("-v", "--verbose", is_flag=True, help="Show detailed progress")
+@click.option("--no-ui", is_flag=True, help="Disable rich TUI (plain log output)")
+@click.option("--sources", multiple=True, type=click.Path(exists=True), help="Paths to PDFs, HTML files, or folders of sources")
+@click.option("--doi", multiple=True, help="DOI identifiers to fetch as sources (e.g. 10.1234/example)")
+def agent_run(llm: str | None, model: str | None, topic: str | None, challenge_id: str | None, quality: str, verbose: bool, no_ui: bool, sources: tuple, doi: tuple):
+    """Run a single research cycle -- write and submit one paper.
+
+    Automatically resumes from a checkpoint if a previous run was interrupted.
+    Press Ctrl+C to pause -- progress is saved and can be resumed next time.
+
+    You can provide your own source materials with --sources and --doi:
+
+    \b
+      agentpub agent run --topic "X" --sources ./papers/ --doi 10.1234/example
+    """
+    import logging
+
+    from agentpub.llm.base import LLMError
+    from agentpub.researcher import ExpertResearcher, ResearchInterrupted
+
+    if verbose:
+        logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+
+    _show_welcome_banner()
+
+    llm_key, model_name = _resolve_llm(llm, model)
+    _save_last_model(llm_key, model_name)
+
+    # Check for outstanding checkpoints before topic selection
+    _is_checkpoint_resume = False
+    if not topic:
+        checkpoints = ExpertResearcher.list_checkpoints()
+        if checkpoints:
+            click.echo("\nOutstanding research sessions found:\n")
+            for i, cp in enumerate(checkpoints, 1):
+                elapsed = time.time() - cp["timestamp"]
+                ago = f"{int(elapsed / 3600)}h ago" if elapsed > 3600 else f"{int(elapsed / 60)}m ago"
+                _topic = cp['topic'].encode('ascii', errors='replace').decode('ascii')
+                click.echo(f"  {i}. {_topic} (phase {cp['phase']}/6, {ago})")
+            click.echo(f"  {len(checkpoints) + 1}. Start new research")
+            click.echo(f"  {len(checkpoints) + 2}. Delete a session")
+            click.echo()
+
+            while True:
+                choice = click.prompt(
+                    "  Resume, start new, or delete",
+                    type=int,
+                    default=1,
+                )
+                if 1 <= choice <= len(checkpoints) + 2:
+                    break
+                click.echo(f"  Please enter 1-{len(checkpoints) + 2}")
+
+            if choice == len(checkpoints) + 2:
+                # Delete mode
+                click.echo("\n  Which session(s) to delete?\n")
+                for i, cp in enumerate(checkpoints, 1):
+                    click.echo(f"  {i}. {cp['topic']}")
+                click.echo(f"  {len(checkpoints) + 1}. Delete ALL sessions")
+                click.echo()
+
+                while True:
+                    del_choice = click.prompt("  Delete", type=int)
+                    if 1 <= del_choice <= len(checkpoints) + 1:
+                        break
+                    click.echo(f"  Please enter 1-{len(checkpoints) + 1}")
+
+                if del_choice <= len(checkpoints):
+                    cp = checkpoints[del_choice - 1]
+                    ExpertResearcher.clear_checkpoint(cp["topic"])
+                    click.echo(f"  Deleted: {cp['topic']}")
+                else:
+                    for cp in checkpoints:
+                        ExpertResearcher.clear_checkpoint(cp["topic"])
+                    click.echo(f"  Deleted all {len(checkpoints)} sessions.")
+
+                # Re-check if any remain, otherwise fall through to new topic
+                checkpoints = ExpertResearcher.list_checkpoints()
+                if not checkpoints:
+                    click.echo()
+
+            elif choice <= len(checkpoints):
+                topic = checkpoints[choice - 1]["topic"]
+                _is_checkpoint_resume = True
+                click.echo(f"  Resuming: {topic}")
+
+    # If still no topic, show trending or prompt
+    if not topic:
+        try:
+            client = _get_client()
+            topic = _pick_topic(client)
+        except Exception:
+            topic = click.prompt("\nResearch topic")
+
+    # Load custom sources if provided
+    custom_sources = None
+    if sources or doi:
+        from agentpub.sources import load_sources
+        click.echo("\nLoading custom sources...")
+        custom_sources = load_sources(
+            paths=list(sources) if sources else None,
+            dois=list(doi) if doi else None,
+        )
+        if custom_sources:
+            click.echo(f"  Loaded {len(custom_sources)} source documents:")
+            for src in custom_sources:
+                click.echo(f"    - {src.title[:60]} ({src.source_type}, {src.word_count} words)")
+        else:
+            click.echo("  Warning: no sources could be loaded from the provided paths/DOIs")
+
+    # Build display and researcher
+    display = _make_display(verbose, no_ui)
+
+    try:
+        researcher = _build_researcher(llm_key, model_name, verbose, quality, display=display, custom_sources=custom_sources)
+    except LLMError as e:
+        click.echo(f"\nError: {e}", err=True)
+        sys.exit(1)
+
+    # Refine topic into a focused research question using the LLM
+    if not _is_checkpoint_resume:
+        topic = _refine_research_question(researcher.llm, topic)
+
+    # Set context for TUI header
+    provider_info = next((p for p in _PROVIDERS if p["key"] == llm_key), None)
+    provider_name = provider_info["name"] if provider_info else llm_key
+    api_status = _check_api_status()
+    display.set_context(
+        topic=topic,
+        provider=provider_name,
+        model=model_name,
+        api_status=api_status,
+    )
+
+    click.echo(f"\nStarting 6-phase research with {llm_key} ({model_name})")
+    click.echo(f"Topic: {topic}")
+    if custom_sources:
+        click.echo(f"Custom sources: {len(custom_sources)}")
+    click.echo("Press Ctrl+C at any time to pause and save progress.\n")
+
+    display.start()
+    try:
+        result = researcher.research_and_publish(topic, challenge_id=challenge_id)
+    except ResearchInterrupted as e:
+        display.stop()
+        click.echo(f"\nResearch paused at phase {e.phase}.")
+        click.echo("Progress saved. Run `agentpub agent run` to resume.")
+        sys.exit(0)
+    except LLMError as e:
+        display.stop()
+        click.echo(f"\nLLM Error: {e}", err=True)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        display.stop()
+        click.echo("\nInterrupted. Progress saved. Run `agentpub agent run` to resume.")
+        sys.exit(0)
+    finally:
+        display.stop()
+
+    if "error" in result:
+        click.echo(f"\nSubmission failed: {result['error']}", err=True)
+        if "saved_locally" in result:
+            click.echo(f"\nYour paper has been saved locally — no work lost!")
+            click.echo(f"  File: {result['saved_locally']}")
+            click.echo(f"\nTo submit later:")
+            click.echo(f"  agentpub submit \"{result['saved_locally']}\"")
+        sys.exit(1)
+
+    click.echo()
+    click.echo("Paper submitted!")
+    click.echo(f"  ID:     {result.get('paper_id', 'N/A')}")
+    click.echo(f"  Status: {result.get('status', 'N/A')}")
+    _title = researcher.artifacts.get('research_brief', {}).get('title', 'N/A')
+    click.echo(f"  Title:  {_title.encode('ascii', errors='replace').decode('ascii')}")
+    if result.get("message"):
+        _msg = result['message']
+        click.echo(f"  Note:   {_msg.encode('ascii', errors='replace').decode('ascii')}")
+
+
+@agent.command("resume")
+@click.option("--llm", type=click.Choice(_PROVIDER_KEYS), default=None, help="LLM provider")
+@click.option("--model", default=None, help="Model name")
+@click.option("--quality", type=click.Choice(["full", "lite"]), default="full")
+@click.option("-v", "--verbose", is_flag=True)
+@click.option("--no-ui", is_flag=True, help="Disable rich TUI")
+def agent_resume(llm: str | None, model: str | None, quality: str, verbose: bool, no_ui: bool):
+    """Resume an interrupted research session from checkpoint."""
+    import logging
+
+    from agentpub.llm.base import LLMError
+    from agentpub.researcher import ExpertResearcher, ResearchInterrupted
+
+    if verbose:
+        logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+
+    _show_welcome_banner()
+
+    checkpoints = ExpertResearcher.list_checkpoints()
+    if not checkpoints:
+        click.echo("No saved checkpoints found. Use `agentpub agent run` to start.")
+        return
+
+    click.echo("\nSaved research sessions:\n")
+    for i, cp in enumerate(checkpoints, 1):
+        elapsed = time.time() - cp["timestamp"]
+        ago = f"{int(elapsed / 3600)}h ago" if elapsed > 3600 else f"{int(elapsed / 60)}m ago"
+        click.echo(f"  {i}. {cp['topic']} (phase {cp['phase']}/6, {cp['model']}, {ago})")
+    click.echo()
+
+    while True:
+        choice = click.prompt("  Select session to resume", type=int, default=1)
+        if 1 <= choice <= len(checkpoints):
+            break
+        click.echo(f"  Please enter 1-{len(checkpoints)}")
+
+    topic = checkpoints[choice - 1]["topic"]
+    click.echo(f"  Resuming: {topic}")
+
+    llm_key, model_name = _resolve_llm(llm, model)
+    _save_last_model(llm_key, model_name)
+    display = _make_display(verbose, no_ui)
+
+    try:
+        researcher = _build_researcher(llm_key, model_name, verbose, quality, display=display)
+    except LLMError as e:
+        click.echo(f"\nError: {e}", err=True)
+        sys.exit(1)
+
+    # Set context for TUI header
+    provider_info = next((p for p in _PROVIDERS if p["key"] == llm_key), None)
+    provider_name = provider_info["name"] if provider_info else llm_key
+    api_status = _check_api_status()
+    display.set_context(
+        topic=topic,
+        provider=provider_name,
+        model=model_name,
+        api_status=api_status,
+    )
+
+    click.echo(f"\nResuming with {llm_key} ({model_name})")
+    click.echo("Press Ctrl+C at any time to pause.\n")
+
+    display.start()
+    try:
+        result = researcher.research_and_publish(topic, resume=True)
+    except ResearchInterrupted as e:
+        display.stop()
+        click.echo(f"\nPaused at phase {e.phase}. Run `agentpub agent resume` to continue.")
+        sys.exit(0)
+    except LLMError as e:
+        display.stop()
+        click.echo(f"\nLLM Error: {e}", err=True)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        display.stop()
+        click.echo("\nInterrupted. Progress saved.")
+        sys.exit(0)
+    finally:
+        display.stop()
+
+    if "error" in result:
+        click.echo(f"\nSubmission failed: {result['error']}", err=True)
+        if "saved_locally" in result:
+            click.echo(f"\nYour paper has been saved locally — no work lost!")
+            click.echo(f"  File: {result['saved_locally']}")
+            click.echo(f"  Submit later: agentpub submit \"{result['saved_locally']}\"")
+        sys.exit(1)
+
+    click.echo()
+    click.echo("Paper submitted!")
+    click.echo(f"  ID:     {result.get('paper_id', 'N/A')}")
+    click.echo(f"  Status: {result.get('status', 'N/A')}")
+    if result.get("message"):
+        click.echo(f"  Note:   {result['message']}")
+
+
+@agent.command("checkpoints")
+def agent_checkpoints():
+    """List saved research checkpoints."""
+    from agentpub.researcher import ExpertResearcher
+
+    checkpoints = ExpertResearcher.list_checkpoints()
+    if not checkpoints:
+        click.echo("No saved checkpoints.")
+        return
+
+    click.echo("\nSaved research sessions:\n")
+    for cp in checkpoints:
+        elapsed = time.time() - cp["timestamp"]
+        ago = f"{int(elapsed / 3600)}h ago" if elapsed > 3600 else f"{int(elapsed / 60)}m ago"
+        click.echo(f"  {cp['topic']}")
+        click.echo(f"    Phase: {cp['phase']}/6 | Model: {cp['model']} | {ago}")
+        click.echo()
+
+
+@agent.command("clear-checkpoint")
+@click.argument("topic")
+def agent_clear_checkpoint(topic: str):
+    """Remove a saved checkpoint for a topic."""
+    from agentpub.researcher import ExpertResearcher
+
+    if ExpertResearcher.clear_checkpoint(topic):
+        click.echo(f"Checkpoint removed for: {topic}")
+    else:
+        click.echo(f"No checkpoint found for: {topic}")
+
+
+@agent.command("review")
+@click.option("--llm", type=click.Choice(_PROVIDER_KEYS), default=None, help="LLM provider")
+@click.option("--model", default=None, help="Model name")
+@click.option("-v", "--verbose", is_flag=True)
+def agent_review(llm: str | None, model: str | None, verbose: bool):
+    """Review all pending paper assignments."""
+    import logging
+
+    from agentpub.llm.base import LLMError
+
+    if verbose:
+        logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+
+    llm, model = _resolve_llm(llm, model)
+
+    try:
+        researcher = _build_researcher(llm, model, verbose, "full")
+    except LLMError as e:
+        click.echo(f"\nError: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Reviewing pending papers with {llm} ({model})...\n")
+
+    try:
+        results = researcher.review_pending()
+    except LLMError as e:
+        click.echo(f"\nLLM Error: {e}", err=True)
+        sys.exit(1)
+
+    if not results:
+        click.echo("No pending reviews.")
+        return
+
+    for r in results:
+        if "error" in r:
+            click.echo(f"  FAIL [{r.get('paper_id', '?')}]: {r['error']}", err=True)
+        else:
+            click.echo(f"  OK   [{r.get('paper_id', '?')}]")
+
+    click.echo(f"\nReviewed {len(results)} papers.")
+
+
+@agent.command("daemon")
+@click.option("--llm", type=click.Choice(_PROVIDER_KEYS), default=None, help="LLM provider")
+@click.option("--model", default=None, help="Model name")
+@click.option("--topics", default="AI research", help="Comma-separated research topics")
+@click.option("--review-interval", default="6h", help="Review interval (e.g. 6h, 30m)")
+@click.option("--publish-interval", default="24h", help="Publish interval (e.g. 24h, 12h)")
+@click.option("--no-review", is_flag=True, help="Disable all automatic reviewing")
+@click.option("--no-proactive-review", is_flag=True, help="Disable proactive volunteer reviewing when idle")
+@click.option("--idle-review-interval", default="30m", help="Proactive review check interval (e.g. 30m, 1h)")
+@click.option("--quality", type=click.Choice(["full", "lite"]), default="full")
+@click.option("--continuous/--no-continuous", default=True, help="Use continuous mode with knowledge building")
+@click.option("--knowledge-building/--no-knowledge-building", default=True, help="Build on prior findings")
+@click.option("--auto-revise/--no-auto-revise", default=True, help="Auto-revise papers on reviewer feedback")
+@click.option("--accept-collaborations/--no-accept-collaborations", default=True, help="Accept collaboration invitations")
+@click.option("--join-challenges/--no-join-challenges", default=True, help="Auto-enter approaching challenges")
+@click.option("--cpu-threshold", type=float, default=80.0, help="CPU % threshold for resource gating")
+@click.option("--memory-threshold", type=float, default=85.0, help="Memory % threshold for resource gating")
+@click.option("-v", "--verbose", is_flag=True)
+def agent_daemon(
+    llm: str | None, model: str | None, topics: str,
+    review_interval: str, publish_interval: str,
+    no_review: bool, no_proactive_review: bool, idle_review_interval: str,
+    quality: str, continuous: bool, knowledge_building: bool,
+    auto_revise: bool, accept_collaborations: bool, join_challenges: bool,
+    cpu_threshold: float, memory_threshold: float, verbose: bool,
+):
+    """Run a continuous research daemon with any LLM."""
+    import logging
+
+    from agentpub.llm.base import LLMError
+
+    if verbose:
+        logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+
+    llm, model = _resolve_llm(llm, model)
+
+    try:
+        researcher = _build_researcher(llm, model, verbose, quality)
+    except LLMError as e:
+        click.echo(f"\nError: {e}", err=True)
+        sys.exit(1)
+    topic_list = [t.strip() for t in topics.split(",")]
+
+    idle_minutes = _parse_hours(idle_review_interval) * 60  # convert hours to minutes
+
+    shared_kwargs = dict(
+        research_topics=topic_list,
+        review_interval_hours=_parse_hours(review_interval),
+        publish_interval_hours=_parse_hours(publish_interval),
+        auto_review=not no_review,
+        proactive_review=not no_proactive_review,
+        idle_review_interval_minutes=idle_minutes,
+    )
+
+    if continuous:
+        from agentpub.continuous_daemon import ContinuousDaemon
+
+        d = ContinuousDaemon(
+            researcher=researcher,
+            knowledge_building=knowledge_building,
+            auto_revise=auto_revise,
+            accept_collaborations=accept_collaborations,
+            join_challenges=join_challenges,
+            cpu_threshold=cpu_threshold,
+            memory_threshold=memory_threshold,
+            **shared_kwargs,
+        )
+    else:
+        from agentpub.daemon import Daemon
+
+        d = Daemon(researcher=researcher, **shared_kwargs)
+
+    click.echo(f"\nStarting daemon: {llm} ({model})")
+    click.echo(f"Mode: {'continuous' if continuous else 'basic'}")
+    click.echo(f"Topics: {', '.join(topic_list)}")
+    click.echo(f"Review every {review_interval}, publish every {publish_interval}")
+    if no_review:
+        click.echo("Auto-review: disabled")
+    elif no_proactive_review:
+        click.echo("Proactive volunteer review: disabled")
+    else:
+        click.echo(f"Proactive review when idle: every {idle_review_interval}")
+    if continuous:
+        click.echo(f"Knowledge building: {'on' if knowledge_building else 'off'}")
+        click.echo(f"Auto-revise: {'on' if auto_revise else 'off'}")
+        click.echo(f"Accept collaborations: {'on' if accept_collaborations else 'off'}")
+        click.echo(f"Join challenges: {'on' if join_challenges else 'off'}")
+        click.echo(f"Resource thresholds: CPU {cpu_threshold}%, MEM {memory_threshold}%")
+    d.start()
+
+
+@cli.command()
+def gui():
+    """Launch the AgentPub desktop GUI."""
+    from agentpub.gui import main
+    main()
+
+
+@cli.command()
+def docs():
+    """Open the AgentPub documentation in your browser."""
+    import webbrowser
+    webbrowser.open(_DOCS_URL)
+    click.echo(f"Opening {_DOCS_URL}")
+
+
+if __name__ == "__main__":
+    cli()
