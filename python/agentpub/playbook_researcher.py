@@ -5482,6 +5482,14 @@ Write a 150-250 word abstract for this paper. Rules:
             references = self._build_submission_references(curated)
             self.artifacts["references"] = references
 
+        # Snapshot the freshly-drafted sections BEFORE any softening/swap/strip
+        # operations. Used as the ultimate fallback if citation density drops
+        # critically low after validation (e.g., after a failed adversarial
+        # cycle strips most citations). Kept in artifacts for later use.
+        self.artifacts["pre_validate_snapshot"] = {
+            k: v for k, v in draft.items() if isinstance(v, str)
+        }
+
         if not draft or not curated:
             logger.warning("No draft or curated papers — skipping validation")
             self.artifacts["final_paper"] = draft
@@ -5905,6 +5913,44 @@ Requirements:
 
         # 6h. Post-fix strength check — verify abstract counts match body, detect over-hedging
         validated_abstract = self._post_fix_strength_check(validated_draft, validated_abstract, references)
+
+        # 6i. FINAL DETERMINISTIC CLEANUP — LLM context editor pass + safety
+        # checks. This is where the context-aware overclaim/count/prestige
+        # rewriting happens (replaces the old regex layers). Used to be
+        # called only from the dead _step4_audit code path; now runs here.
+        validated_draft, validated_abstract = self._final_deterministic_cleanup(
+            validated_draft, validated_abstract, references,
+        )
+
+        # 6j. Citation density ultimate fallback — if a section is STILL
+        # critically under-cited after all validation (e.g. adversarial
+        # cycle failed and stripped citations, pre-adversarial draft also
+        # sparse), restore from the pre-validate snapshot taken at the very
+        # start. This is the last line of defense.
+        snapshot = self.artifacts.get("pre_validate_snapshot") or {}
+        if snapshot:
+            _cite_pat = re.compile(
+                r"\[([A-Z][a-zA-Z" + _HYPH + r"]+(?:\s+et\s+al\.?)?,\s*\d{4}[a-z]?)\]"
+            )
+            _MIN = {"Results": 8, "Discussion": 6, "Related Work": 12, "Limitations": 2}
+            for sec, min_cites in _MIN.items():
+                cur = validated_draft.get(sec, "")
+                if not cur:
+                    continue
+                cur_n = len(set(_cite_pat.findall(cur)))
+                if cur_n >= min_cites * 0.5:
+                    continue  # acceptable, don't replace
+                snap_text = snapshot.get(sec, "")
+                snap_n = len(set(_cite_pat.findall(snap_text)))
+                if snap_n > cur_n and snap_n >= min_cites * 0.5:
+                    logger.warning(
+                        "Restoring %s from pre-validate snapshot (%d → %d citations, min: %d)",
+                        sec, cur_n, snap_n, min_cites,
+                    )
+                    self.display.step(
+                        f"  RESTORED {sec} from pre-validate snapshot ({cur_n}→{snap_n} citations)"
+                    )
+                    validated_draft[sec] = snap_text
 
         self.artifacts["abstract"] = validated_abstract
         self.artifacts["final_paper"] = validated_draft
