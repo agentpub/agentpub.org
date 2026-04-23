@@ -477,6 +477,12 @@ class AgentPubGUI(tk.Tk):
                 pass
 
         self._build_ui()
+        # Populate _api_key_var from saved config so the setup nag and the
+        # START preflight recognise the user as already logged in. _build_ui
+        # creates _api_key_var as an empty StringVar, so this must run after.
+        if _saved_key:
+            self._api_key_var.set(_saved_key)
+            self._update_account_display()
         self._load_state()
         self._load_challenges()
         self._refresh_agent_status()
@@ -4411,11 +4417,13 @@ Documentation
             )
             return
 
-        # Preflight: validate the session token before burning ~1h of LLM tokens
-        # on a paper that would fail at submit time anyway.
+        # Preflight: validate the session token before burning ~1h of LLM tokens.
+        # Build a FRESH client from the current _api_key_var — don't reuse
+        # self._client, which may have been built at init time with a stale
+        # token from a previous session.
         try:
             from agentpub.client import AgentPub as _AP
-            _pf_client = self._client or _AP(api_key=api_key, base_url=os.environ.get("AA_BASE_URL"))
+            _pf_client = _AP(api_key=api_key, base_url=os.environ.get("AA_BASE_URL"))
             status = _pf_client.validate_session()
         except Exception as e:
             status = {"ok": False, "reason": "network", "detail": str(e)}
@@ -4423,19 +4431,16 @@ Documentation
             reason = status.get("reason", "unknown")
             detail = status.get("detail", "")
             if reason == "unauthenticated":
-                # Clear the stale token so re-login is clean
-                _save_config({
-                    "api_key": "", "session_token": "", "owner_email": "",
-                    "display_name": "", "agent_id": "",
-                })
-                self._api_key_var.set("")
-                self._client = None
-                self._update_account_display()
-                messagebox.showwarning(
+                if messagebox.askokcancel(
                     "Session Expired",
-                    "Your AgentPub session has expired. Please log in again via "
-                    "Account → Login… before starting a run.",
-                )
+                    "Your AgentPub session was rejected by the server.\n\n"
+                    "This usually means the saved token has expired. Click OK "
+                    "to open the Login dialog and log in again, or Cancel to "
+                    "abort the run.",
+                    default="ok",
+                    parent=self,
+                ):
+                    self._open_register()
             elif reason in ("suspended", "closed", "locked", "forbidden"):
                 messagebox.showerror("Account Unavailable", detail or f"Account is {reason}.")
             else:
@@ -4445,6 +4450,9 @@ Documentation
                     "Check your internet connection and try again.",
                 )
             return
+        # Session is valid — refresh self._client so the rest of the run uses
+        # the confirmed-good token.
+        self._client = _pf_client
 
         env_var = provider_info.get("env_var")
         if env_var and self._llm_key_var.get().strip():
