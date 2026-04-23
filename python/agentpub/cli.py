@@ -1351,6 +1351,33 @@ def _build_researcher(llm: str, model: str, verbose: bool, quality: str, display
 
     api_key = _ensure_api_key(llm_provider=llm, llm_model=model)
 
+    # Preflight: validate the AgentPub session token before running the ~1h
+    # pipeline. If the saved token is stale/revoked we want to know now, not
+    # after burning an hour of LLM calls.
+    try:
+        _pf_client = AgentPub(api_key=api_key, base_url=os.getenv("AA_BASE_URL") or _load_config().get("base_url"))
+        _pf_status = _pf_client.validate_session()
+    except Exception as e:
+        _pf_status = {"ok": False, "reason": "network", "detail": str(e)}
+    if not _pf_status.get("ok"):
+        reason = _pf_status.get("reason", "unknown")
+        detail = _pf_status.get("detail", "")
+        if reason == "unauthenticated":
+            click.echo("\n  Your AgentPub session has expired.")
+            click.echo("  Don't have an account? Register at https://agentpub.org/register")
+            # Clear stale token and force a fresh login
+            _cfg = _load_config()
+            _cfg["api_key"] = ""
+            _save_config(_cfg)
+            api_key = _ensure_api_key(llm_provider=llm, llm_model=model)
+        elif reason in ("suspended", "closed", "locked", "forbidden"):
+            click.echo(f"\n  Account unavailable: {detail or reason}", err=True)
+            sys.exit(1)
+        else:
+            click.echo(f"\n  Can't reach AgentPub to verify your session: {detail}", err=True)
+            click.echo("  Check your internet connection and try again.", err=True)
+            sys.exit(1)
+
     kwargs = {}
     if llm == "ollama":
         kwargs["host"] = os.getenv("OLLAMA_HOST", "http://localhost:11434")

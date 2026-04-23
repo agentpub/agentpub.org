@@ -680,6 +680,45 @@ class AgentPub:
         except Exception:
             return ""
 
+    def validate_session(self) -> dict:
+        """Check whether the stored session token is still valid.
+
+        Returns a dict:
+          {"ok": True, "agent_id": ..., "status": ...}      — good to go
+          {"ok": False, "reason": "unauthenticated" | "suspended" | "closed" | "locked" | "network", "detail": "..."}
+
+        Used as a preflight before expensive pipeline work so we fail in
+        <1s rather than after an hour of LLM calls.
+        """
+        import httpx
+        try:
+            data = self._request("GET", "/auth/me/status")
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code == 401:
+                return {"ok": False, "reason": "unauthenticated", "detail": "Session token is invalid or expired."}
+            if code == 403:
+                detail = ""
+                try:
+                    detail = e.response.json().get("detail", "")
+                except Exception:
+                    pass
+                reason = "suspended" if "suspend" in detail.lower() else (
+                    "closed" if "closed" in detail.lower() else (
+                        "locked" if "lock" in detail.lower() else "forbidden"))
+                return {"ok": False, "reason": reason, "detail": detail or "Access denied."}
+            return {"ok": False, "reason": "network", "detail": f"HTTP {code}"}
+        except httpx.HTTPError as e:
+            return {"ok": False, "reason": "network", "detail": str(e)}
+        except Exception as e:
+            return {"ok": False, "reason": "network", "detail": str(e)}
+        return {
+            "ok": True,
+            "agent_id": data.get("agent_id", ""),
+            "status": data.get("status", "active"),
+            "display_name": data.get("display_name", ""),
+        }
+
     def list_my_papers(self, status: str | None = None) -> list:
         """List papers authored by the current agent, optionally filtered by status."""
         agent_id = self.get_my_agent_id()

@@ -487,6 +487,10 @@ class AgentPubGUI(tk.Tk):
         self.bind("<Control-plus>", lambda _e: self._zoom_font(1))
         self.bind("<Control-minus>", lambda _e: self._zoom_font(-1))
 
+        # First-run nag: check both requirements (AgentPub login + LLM API key)
+        # in one combined dialog. Shown once per launch after the window paints.
+        self.after(400, self._show_setup_nag)
+
     # ------------------------------------------------------------------
     # Custom ttk styles
     # ------------------------------------------------------------------
@@ -564,6 +568,52 @@ class AgentPubGUI(tk.Tk):
     def _menu_login(self) -> None:
         """Account > Login — delegates to existing login dialog."""
         self._open_register()
+
+    def _show_setup_nag(self) -> None:
+        """First-run dialog: check both requirements — AgentPub account AND
+        an LLM API key for the selected provider.
+
+        Shows a single combined dialog listing exactly what's missing. Dismissed
+        silently if both are already satisfied. Ollama (no key needed) counts
+        as satisfied.
+        """
+        missing_login = not self._api_key_var.get().strip()
+
+        try:
+            provider_info = self._get_selected_provider()
+        except Exception:
+            provider_info = None
+        needs_llm_key = bool(provider_info and provider_info.get("needs_key"))
+        missing_llm_key = needs_llm_key and not self._llm_key_var.get().strip()
+
+        if not (missing_login or missing_llm_key):
+            return
+
+        lines = ["Before you can generate or submit papers, the following needs to be set up:\n"]
+        if missing_login:
+            lines.append(
+                "• AgentPub account — sign in via Account → Login…\n"
+                "  Don't have one? Register free at https://agentpub.org/register"
+            )
+        if missing_llm_key:
+            provider_name = (provider_info or {}).get("name", "your LLM provider")
+            lines.append(
+                f"• {provider_name} API key — click \"Configure…\" next to the Model dropdown "
+                "to paste your key. (Or pick Ollama to run a local model without any key.)"
+            )
+        lines.append(
+            "\nThe START button is disabled until both are set. Click OK to log in now, "
+            "or Cancel to configure later."
+        )
+
+        resp = messagebox.askokcancel(
+            "Setup required",
+            "\n\n".join(lines),
+            default="ok",
+            parent=self,
+        )
+        if resp and missing_login:
+            self._open_register()
 
     def _menu_logout(self) -> None:
         """Account > Logout — delegates to existing logout logic."""
@@ -4353,12 +4403,110 @@ Documentation
 
         api_key = self._api_key_var.get().strip()
         if not api_key:
-            messagebox.showwarning("Not Logged In", "Please log in first (click Login button).")
+            messagebox.showwarning(
+                "Not Logged In",
+                "You need an AgentPub account to generate and submit papers.\n\n"
+                "• Log in via Account → Login…\n"
+                "• Don't have an account yet? Register at https://agentpub.org/register",
+            )
+            return
+
+        # Preflight: validate the session token before burning ~1h of LLM tokens
+        # on a paper that would fail at submit time anyway.
+        try:
+            from agentpub.client import AgentPub as _AP
+            _pf_client = self._client or _AP(api_key=api_key, base_url=os.environ.get("AA_BASE_URL"))
+            status = _pf_client.validate_session()
+        except Exception as e:
+            status = {"ok": False, "reason": "network", "detail": str(e)}
+        if not status.get("ok"):
+            reason = status.get("reason", "unknown")
+            detail = status.get("detail", "")
+            if reason == "unauthenticated":
+                # Clear the stale token so re-login is clean
+                _save_config({
+                    "api_key": "", "session_token": "", "owner_email": "",
+                    "display_name": "", "agent_id": "",
+                })
+                self._api_key_var.set("")
+                self._client = None
+                self._update_account_display()
+                messagebox.showwarning(
+                    "Session Expired",
+                    "Your AgentPub session has expired. Please log in again via "
+                    "Account → Login… before starting a run.",
+                )
+            elif reason in ("suspended", "closed", "locked", "forbidden"):
+                messagebox.showerror("Account Unavailable", detail or f"Account is {reason}.")
+            else:
+                messagebox.showwarning(
+                    "Can't Reach AgentPub",
+                    f"Unable to verify your session before starting ({detail}).\n\n"
+                    "Check your internet connection and try again.",
+                )
             return
 
         env_var = provider_info.get("env_var")
         if env_var and self._llm_key_var.get().strip():
             os.environ[env_var] = self._llm_key_var.get().strip()
+
+        # Preflight: verify the LLM provider is usable before burning ~1h on
+        # generation. Catches (a) wrong-provider key (e.g. Gemini key pasted
+        # into the OpenAI field), (b) expired/revoked LLM key, (c) Ollama not
+        # installed or not running, (d) model not pulled yet.
+        try:
+            from agentpub.llm import get_backend as _pf_get_backend
+            _pf_kwargs = {}
+            if llm_key_name == "ollama":
+                _pf_kwargs["host"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+            _pf_backend = _pf_get_backend(llm_key_name, model=model_name, **_pf_kwargs)
+            if llm_key_name == "ollama":
+                # _ensure_ready checks: ollama running, binary installed, model pulled
+                if hasattr(_pf_backend, "_ensure_ready"):
+                    _pf_backend._ensure_ready()
+            else:
+                # Tiny probe call — 401/403 means wrong or expired key
+                _pf_resp = _pf_backend.generate(
+                    system="Reply with exactly: OK",
+                    prompt="Say OK",
+                    temperature=0.0,
+                    max_tokens=200,
+                )
+                if not (_pf_resp.text or "").strip():
+                    raise RuntimeError(f"{provider_info['name']} returned an empty response — the key may be invalid.")
+        except Exception as e:
+            err_str = str(e)
+            err_lower = err_str.lower()
+            if "not installed" in err_lower or "install it from" in err_lower:
+                messagebox.showerror(
+                    "Ollama Not Installed",
+                    "Ollama is not installed on this machine.\n\n"
+                    "Install it from: https://ollama.com/download\n\n"
+                    "Or switch to a cloud provider (OpenAI / Anthropic / Gemini) "
+                    "in the Model dropdown.",
+                )
+            elif "could not start ollama" in err_lower or "ollama serve" in err_lower:
+                messagebox.showerror(
+                    "Ollama Not Running",
+                    f"Ollama is installed but could not be started automatically.\n\n"
+                    f"Open a terminal and run:\n    ollama serve\n\nDetail: {err_str[:200]}",
+                )
+            elif any(t in err_lower for t in ("auth", "401", "403", "invalid", "unauthorized", "api key")):
+                messagebox.showerror(
+                    "LLM API Key Invalid",
+                    f"Your {provider_info['name']} API key was rejected.\n\n"
+                    "• Make sure the key matches the selected provider "
+                    "(e.g. an OpenAI key in the OpenAI slot, a Gemini key in the Gemini slot).\n"
+                    "• Click \"Configure…\" next to the Model dropdown to paste a new key.\n\n"
+                    f"Detail: {err_str[:200]}",
+                )
+            else:
+                messagebox.showerror(
+                    f"{provider_info['name']} Not Reachable",
+                    f"Could not reach {provider_info['name']} to verify your setup.\n\n"
+                    f"Check your internet connection, then try again.\n\nDetail: {err_str[:200]}",
+                )
+            return
 
         # Build topics from the active mode
         mode = self._topic_mode_var.get()
