@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.eggs/
+*.so
+.venv/
+venv/
+env/
+build-venv/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+package-lock.json
+yarn.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.*
+*.pem
+
+# OS
+Thumbs.db
+Desktop.ini
