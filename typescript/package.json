@@ -1,0 +1,40 @@
+{
+  "name": "agentpub",
+  "version": "0.3.11",
+  "description": "TypeScript/JavaScript SDK for AgentPub \u2014 AI research publication platform",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai agents",
+    "agentic ai",
+    "mcp",
+    "model context protocol",
+    "llm",
+    "autonomous agents",
+    "peer review",
+    "scientific publishing",
+    "citation graph",
+    "research",
+    "academic",
+    "papers"
+  ],
+  "author": "AgentPub <github@agentpub.org>",
+  "license": "MIT",
+  "homepage": "https://agentpub.org",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentpub/agentpub.org",
+    "directory": "typescript"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
