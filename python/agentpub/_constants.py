@@ -1,0 +1,373 @@
+"""Shared constants and configuration for AgentPub research pipelines."""
+
+from __future__ import annotations
+
+import pathlib
+from dataclasses import dataclass
+
+# ---------------------------------------------------------------------------
+# Section ordering
+# ---------------------------------------------------------------------------
+
+_WRITE_ORDER = [
+    "Methodology",
+    "Results",
+    "Discussion",
+    "Related Work",
+    "Introduction",
+    "Limitations",
+    "Conclusion",
+]
+
+_SUBMIT_ORDER = [
+    "Introduction",
+    "Related Work",
+    "Methodology",
+    "Results",
+    "Discussion",
+    "Limitations",
+    "Conclusion",
+]
+
+# ---------------------------------------------------------------------------
+# Word count targets and minimums per section
+# ---------------------------------------------------------------------------
+#
+# These mirror the per-section table in AGENT_INSTRUCTIONS.md, which is served
+# live at https://api.agentpub.org/v1/instructions and is what every agent is
+# told to follow. They used to differ on five of seven sections — the app aimed
+# for 8,250 words against the document's 7,000 — so the desktop app and the
+# published guidance were quietly building to different specifications.
+#
+# If the instructions change, change these with them.
+
+#: Sums to 7,500 — mid-band of the 7,000-9,000 the instructions advise aiming
+#: for, and the exact per-section figures that document publishes.
+_SECTION_WORD_TARGETS: dict[str, int] = {
+    "Introduction": 900,
+    "Related Work": 1500,
+    "Methodology": 1200,
+    "Results": 1500,
+    "Discussion": 1500,
+    "Limitations": 500,
+    "Conclusion": 400,
+}
+
+#: Sums to 6,530, which must stay above MIN_TOTAL_WORDS_FOR_SUBMISSION below.
+#: The previous minimums summed to 5,450, so a paper could hit every single
+#: section minimum and still be under the total needed to submit — the failure
+#: appeared only at the end of a full run.
+_SECTION_WORD_MINIMUMS: dict[str, int] = {
+    "Introduction": 800,
+    "Related Work": 1300,
+    "Methodology": 1050,
+    "Results": 1300,
+    "Discussion": 1300,
+    "Limitations": 430,
+    "Conclusion": 350,
+}
+
+#: The floor the platform's writing instructions state ("6,000-15,000 words
+#: total ... reviewers reject under 6,000").
+#:
+#: The API's own hard gate is lower — MIN_WORD_COUNT defaults to 4,000 — so a
+#: shorter paper is accepted by the endpoint and then rejected by reviewers.
+#: The app targets the number that decides whether the work survives, not the
+#: one that merely gets it past validation.
+MIN_TOTAL_WORDS_FOR_SUBMISSION: int = 6000
+MAX_TOTAL_WORDS_FOR_SUBMISSION: int = 15000
+
+# ---------------------------------------------------------------------------
+# Token limits per section (max_tokens passed to LLM generate)
+# These are capped by each model's actual limit via _effective_max_tokens()
+# ---------------------------------------------------------------------------
+
+_SECTION_TOKEN_LIMITS: dict[str, int] = {
+    "Introduction": 65000,
+    "Related Work": 65000,
+    "Methodology": 65000,
+    "Results": 65000,
+    "Discussion": 65000,
+    "Limitations": 65000,
+    "Conclusion": 65000,
+    "Abstract": 16000,
+}
+
+# ---------------------------------------------------------------------------
+# Checkpoint directory
+# ---------------------------------------------------------------------------
+# Backwards-compatible: keep `_CHECKPOINT_DIR` as a Path constant for callers
+# that import it directly. New code should prefer `default_checkpoint_dir()`
+# which is lazy and respects env-var override (`AGENTPUB_HOME`). The lazy
+# function is what the cloud-runner path swaps out, but for the local CLI
+# path the constant and the function point to the same place.
+
+def default_agentpub_home() -> pathlib.Path:
+    """Returns the SDK home directory.
+
+    Resolution order:
+      1. ``$AGENTPUB_HOME`` env var if set (allows cloud runner to relocate
+         the SDK's writable area to a writable Cloud Run /tmp path even
+         when LocalStorage is used as a fallback).
+      2. ``~/.agentpub``
+    """
+    import os
+    env = os.environ.get("AGENTPUB_HOME")
+    if env:
+        return pathlib.Path(env)
+    return pathlib.Path.home() / ".agentpub"
+
+
+def default_checkpoint_dir() -> pathlib.Path:
+    """Returns the checkpoint directory under the agentpub home."""
+    return default_agentpub_home() / "checkpoints"
+
+
+# Eager constant kept for backwards compatibility with existing imports.
+# Cloud runner code paths must NOT rely on this — they should construct a
+# StorageBackend instance and pass it to the SDK.
+_CHECKPOINT_DIR = pathlib.Path.home() / ".agentpub" / "checkpoints"
+
+# ---------------------------------------------------------------------------
+# Default empty research brief
+# ---------------------------------------------------------------------------
+
+_EMPTY_BRIEF: dict = {
+    "title": "",
+    "search_terms": [],
+    "research_questions": [],
+    "paper_type": "survey",
+}
+
+# ---------------------------------------------------------------------------
+# Pipeline configuration
+# ---------------------------------------------------------------------------
+
+
+class ResearchInterrupted(Exception):
+    """Raised when the user interrupts research with Ctrl+C."""
+
+    def __init__(self, phase: int, artifacts: dict):
+        self.phase = phase
+        self.artifacts = artifacts
+        super().__init__(f"Research interrupted during phase {phase}")
+
+
+# ---------------------------------------------------------------------------
+# CorpusManifest — single source of truth for corpus counts (Change 1)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CorpusManifest:
+    """Frozen record of corpus counts at each pipeline stage.
+
+    Created once after the research phase.  Every part of the pipeline
+    that needs "how many papers" uses ``display_count`` — no other
+    source of truth exists.
+    """
+
+    total_retrieved: int = 0
+    total_after_dedup: int = 0
+    total_after_filter: int = 0
+    total_included: int = 0
+    total_in_final_refs: int = 0
+    full_text_count: int = 0
+    abstract_only_count: int = 0
+    databases: tuple[str, ...] = ()
+    year_range: str = ""
+
+    @property
+    def display_count(self) -> int:
+        """The ONE number to use everywhere for 'N studies reviewed'."""
+        return self.total_in_final_refs if self.total_in_final_refs else self.total_included
+
+
+# ---------------------------------------------------------------------------
+# PipelineStep — structured process log entry (Change 3)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineStep:
+    """A single recorded step in the pipeline process log."""
+
+    name: str           # e.g. "search", "dedup", "filter", "enrich", "write", "validate"
+    description: str    # human-readable summary of what happened
+    timestamp: float    # time.time() when step completed
+    input_count: int = 0   # items entering this step
+    output_count: int = 0  # items leaving this step
+    details: dict = None   # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.details is None:
+            self.details = {}
+
+
+# ---------------------------------------------------------------------------
+# Reference targets by paper complexity (Fix 2A)
+# ---------------------------------------------------------------------------
+
+_REF_TARGETS: dict[str, dict[str, int]] = {
+    "single_domain": {"min": 20, "target": 28},
+    "cross_domain": {"min": 35, "target": 45},
+    "meta_analysis": {"min": 40, "target": 50},
+}
+
+
+@dataclass
+class ParagraphSpec:
+    """Specification for a single paragraph to be written."""
+
+    paragraph_id: str           # "results_p3"
+    section: str                # "Results"
+    goal: str                   # "Compare SWS vs REM effect sizes on declarative memory"
+    claim_type: str             # "descriptive_synthesis" | "corpus_bounded_inference" | "gap_identification"
+    evidence_indices: list[int] = None  # paper indices from curated list  # type: ignore[assignment]
+    allowed_citations: list[str] = None  # ["[Gais and Born, 2004]", "[Rasch and Born, 2013]"]  # type: ignore[assignment]
+    allowed_strength: str = "strong"  # "strong" | "moderate" | "weak"
+    transition_from: str | None = None  # previous paragraph_id
+    target_words: int = 160
+
+    def __post_init__(self):
+        if self.evidence_indices is None:
+            self.evidence_indices = []
+        if self.allowed_citations is None:
+            self.allowed_citations = []
+
+
+@dataclass
+class WrittenParagraph:
+    """A single written paragraph with metadata."""
+
+    paragraph_id: str
+    section: str
+    text: str
+    citations_used: list[str] = None  # type: ignore[assignment]
+    word_count: int = 0
+
+    def __post_init__(self):
+        if self.citations_used is None:
+            self.citations_used = []
+        if not self.word_count and self.text:
+            self.word_count = len(self.text.split())
+
+
+@dataclass
+class ResearchConfig:
+    """Tuneable knobs for the research pipeline."""
+
+    max_search_results: int = 30
+    min_references: int = 20
+    max_papers_to_read: int = 20
+    max_reread_loops: int = 2
+    api_delay_seconds: float = 0.5
+    quality_level: str = "full"  # "full" or "lite" (for weaker models)
+    verbose: bool = False
+    min_total_words: int = 4000
+    max_total_words: int = 15000
+    target_words_per_section: int = 1000
+    max_expand_passes: int = 4
+    web_search: bool = True
+    pipeline_mode: str = "paragraph"  # "paragraph" (per-paragraph) | "section" (per-section legacy)
+    # Per-section token limits (override _SECTION_TOKEN_LIMITS defaults)
+    section_token_limits: dict | None = None
+    # Per-section word targets (override _SECTION_WORD_TARGETS defaults)
+    section_word_targets: dict | None = None
+    # Per-section word minimums (override _SECTION_WORD_MINIMUMS defaults)
+    section_word_minimums: dict | None = None
+    # Adversarial review loop (harness engineering pattern)
+    adversarial_review_enabled: bool = True
+    adversarial_max_cycles: int = 2
+    adversarial_fix_majors: bool = True  # fix MAJOR findings too, not just FATAL
+    # Paragraph-level writing (pipeline_mode="paragraph")
+    paragraph_stitch: bool = True       # enable transition smoothing between paragraphs
+    paragraph_target_words: int = 160   # default per paragraph
+    # Novelty check (inspired by AI Scientist-v2)
+    novelty_check_enabled: bool = True
+    novelty_similarity_threshold: float = 0.7
+    # Structured reflection pass
+    structured_reflection_enabled: bool = True
+    # Citation gap fill during writing
+    citation_gap_fill_enabled: bool = True
+    max_gap_fills_per_section: int = 3
+    # Citation justification audit
+    citation_justification_audit: bool = True
+    citation_min_retention_ratio: float = 0.7  # per-section: revert that section if < 70% of its cites retained
+    # Block submission when the citation auditor classifies more than this
+    # fraction of unique cited refs as MISATTRIBUTED or UNSUPPORTED. Default
+    # 0.4 = block if the auditor flagged 40%+ of unique cites as bad. The
+    # signal is based on auditor findings, not on after-revert state, because
+    # per-section reverts can restore original text but the original IS the
+    # problem we are trying to catch.
+    citation_audit_block_threshold: float = 0.4
+    citation_audit_required: bool = True  # block submission if paper trips citation_audit_block_threshold
+    # When the audit trips the block threshold, automatically rewrite the
+    # flagged sections with the auditor's specific findings as targeted
+    # feedback, then re-audit. Up to N cycles before giving up and falling
+    # back to the submission gate. Default 2 cycles ≈ 3x audit cost in worst
+    # case. Set to 0 to disable retry (gate fires immediately on first block).
+    audit_retry_max_cycles: int = 2
+    # Review model routing
+    review_model: str | None = None  # optional separate model for review passes
+    review_provider: str | None = None  # optional separate provider for review passes
+    # Pre-submit self-eval reliability (Phase 10)
+    pre_submit_eval_required: bool = True   # block submission if self-eval fails to produce a verdict
+    pre_submit_eval_max_retries: int = 2    # extra attempts on top of the first call (3 total)
+    # Structured paragraph writer (Phase 11)
+    # When True, paragraphs are generated as JSON matching a schema that
+    # enumerates the allowed cite keys and requires a verbatim supporting_quote
+    # per evidence point. Fabricated cite keys and unsupported claims become
+    # structurally impossible at generation time. Falls back to free-form
+    # writing if the backend does not implement ``generate_structured``.
+    structured_writer_enabled: bool = True
+    structured_writer_max_retries: int = 1  # 1 retry on validation failure
+    structured_writer_min_points: int = 1
+    structured_writer_max_points: int = 4
+    # Paper-wide cap on how many times any single source can be cited. When
+    # a source hits this number, the structured writer filters it out of the
+    # cite-key enum for subsequent paragraphs (unless that would empty the
+    # enum). Prior runs hit Frankland 13x / Stocco 11x / Nader 25x — a hard
+    # cap forces the writer onto its breadth of allowed cite keys instead of
+    # leaning on a single source.
+    max_citations_per_source: int = 8
+    # Section-aware writing (Phase 11)
+    # After each section finishes, a 3-sentence summary is generated and
+    # injected into the writer prompt for subsequent sections. Discussion
+    # can then reference Results without restating it.
+    section_summaries_enabled: bool = True
+
+
+@dataclass
+class ReviewFinding:
+    """A single finding from the adversarial review."""
+
+    severity: str  # "FATAL", "MAJOR", "MINOR"
+    category: str  # e.g. "citation_mismatch", "fabrication", "overclaiming"
+    section: str  # affected section name
+    quote: str  # exact text from the paper
+    problem: str  # what is wrong
+    suggested_fix: str  # how to fix it
+    resolved: bool = False
+
+
+@dataclass
+class AdversarialReviewReport:
+    """Result of one adversarial review cycle."""
+
+    cycle: int
+    findings: list  # list[ReviewFinding]
+
+    @property
+    def fatal_count(self) -> int:
+        return sum(1 for f in self.findings if f.severity == "FATAL")
+
+    @property
+    def major_count(self) -> int:
+        return sum(1 for f in self.findings if f.severity == "MAJOR")
+
+    @property
+    def minor_count(self) -> int:
+        return sum(1 for f in self.findings if f.severity == "MINOR")
+
+    @property
+    def needs_fixes(self) -> bool:
+        return self.fatal_count > 0
